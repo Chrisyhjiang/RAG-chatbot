@@ -3,33 +3,115 @@ import json
 import os
 from sentence_transformers import SentenceTransformer
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-import re
+import psycopg2
+from psycopg2.extras import Json
 
 # Ensure you have set the OPENAI_API_KEY in your environment variables
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class RAGSystem:
-    def __init__(self, knowledge_base_path='knowledge_base.json'):
+    def __init__(self, knowledge_base_path='knowledge_base.json', db_host=None, db_port=None, db_name=None, db_user=None, db_password=None):
         self.knowledge_base_path = knowledge_base_path
-        self.knowledge_base = self.load_knowledge_base()
+        
+        # Database connection setup
+        self.db_host = db_host or os.getenv('DB_HOST', 'localhost')
+        self.db_port = db_port or int(os.getenv('DB_PORT', 5432))
+        self.db_name = db_name or os.getenv('DB_NAME', 'rag_system')
+        self.db_user = db_user or os.getenv('DB_USER', 'user')
+        self.db_password = db_password or os.getenv('DB_PASSWORD', 'password')
+
+        self.conn = psycopg2.connect(
+            host=self.db_host,
+            port=self.db_port,
+            dbname=self.db_name,
+            user=self.db_user,
+            password=self.db_password
+        )
+        
         self.model = SentenceTransformer('all-MiniLM-L6-v2')
-        self.doc_embeddings = self.embed_knowledge_base()
+        
+        # Load knowledge base and embed
+        self.load_knowledge_base()
+        self.embed_knowledge_base()
 
     def load_knowledge_base(self):
         """
         Load the knowledge base from a JSON file.
         """
         with open(self.knowledge_base_path, 'r') as kb_file:
-            return json.load(kb_file)
+            self.knowledge_base = json.load(kb_file)
 
     def embed_knowledge_base(self):
         """
-        Embed the knowledge base using the SentenceTransformer model.
-        Combines 'about' and 'text' fields for each document for embedding.
+        Embed the knowledge base using the SentenceTransformer model and update the embeddings in PostgreSQL.
+        If the table doesn't exist, create it and insert the embeddings.
         """
         docs = [f'{doc["about"]}. {doc["text"]}' for doc in self.knowledge_base]
-        return self.model.encode(docs, convert_to_tensor=True)
+
+        embeddings = self.model.encode(docs, convert_to_tensor=False)
+        
+        with self.conn.cursor() as cur:
+            # Ensure pgvector extension is enabled
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            
+            # Check if the table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'documents'
+                );
+            """)
+            
+            table_exists = cur.fetchone()[0]
+
+            if not table_exists:
+                # Create the table if it doesn't exist
+                print("Table 'documents' does not exist. Creating the table and inserting data...")
+                cur.execute("""
+                    CREATE TABLE documents (
+                        id SERIAL PRIMARY KEY,
+                        doc_id VARCHAR(255) UNIQUE NOT NULL,
+                        about TEXT,
+                        text TEXT,
+                        embedding VECTOR(384)
+                    );
+                """)
+                
+                # Insert all documents into the new table
+                for i, doc in enumerate(self.knowledge_base):
+                    cur.execute("""
+                        INSERT INTO documents (doc_id, about, text, embedding)
+                        VALUES (%s, %s, %s, %s);
+                    """, (doc["id"], doc["about"], doc["text"], embeddings[i].tolist()))
+
+            else:
+                # Update existing records and insert new ones if the table exists
+                print("Table 'documents' exists. Updating existing records and inserting new ones...")
+                
+                for i, doc in enumerate(self.knowledge_base):
+                    # Check if the document already exists
+                    cur.execute("""
+                        SELECT doc_id FROM documents WHERE doc_id = %s;
+                    """, (doc["id"],))
+                    
+                    existing_doc = cur.fetchone()
+
+                    if existing_doc:
+                        # Update the existing document
+                        cur.execute("""
+                            UPDATE documents
+                            SET about = %s, text = %s, embedding = %s
+                            WHERE doc_id = %s;
+                        """, (doc["about"], doc["text"], embeddings[i].tolist(), doc["id"]))
+                    else:
+                        # Insert the new document
+                        cur.execute("""
+                            INSERT INTO documents (doc_id, about, text, embedding)
+                            VALUES (%s, %s, %s, %s);
+                        """, (doc["id"], doc["about"], doc["text"], embeddings[i].tolist()))
+
+            # Commit the transaction to save changes
+            self.conn.commit()
 
     def normalize_query(self, query):
         """
@@ -37,44 +119,38 @@ class RAGSystem:
         """
         return query.lower().strip()
 
-    def retrieve(self, query, similarity_threshold=0.7, high_match_threshold=0.8, max_docs=5):
+    def retrieve(self, query, similarity_threshold=0.7, max_docs=5):
+        """
+        Retrieve relevant documents using KNN search with pgvector.
+        """
         # Normalize query
         normalized_query = self.normalize_query(query)
         print(f"Retrieving context for query: '{normalized_query}'")
 
         # Query embedding
-        query_embedding = self.model.encode([normalized_query], convert_to_tensor=True)
+        query_embedding = self.model.encode([normalized_query])[0].tolist()
 
-        # Calculate similarities
-        similarities = cosine_similarity(query_embedding, self.doc_embeddings)[0]
-
-        # Initialize relevance scores
-        relevance_scores = []
-
-        for i, doc in enumerate(self.knowledge_base):
-            # Calculate about and text similarities separately
-            about_similarity = cosine_similarity(query_embedding, self.model.encode([doc["about"]]))[0][0]
-            text_similarity = similarities[i]  # Already calculated
+        with self.conn.cursor() as cur:
+            # Perform KNN search using cosine similarity
+            cur.execute("""
+                SELECT doc_id, about, text, 1 - (embedding <=> %s) AS similarity
+                FROM documents
+                ORDER BY embedding <=> %s
+                LIMIT %s;
+            """, (query_embedding, query_embedding, max_docs))
             
-            # Give more weight to text similarity
-            combined_score = (0.3 * about_similarity) + (0.7 * text_similarity)
-            
-            # If either about or text similarity is above the high match threshold, prioritize it
-            if about_similarity >= high_match_threshold or text_similarity >= high_match_threshold:
-                combined_score = max(about_similarity, text_similarity)
-                
-            relevance_scores.append((i, combined_score))
+            results = cur.fetchall()
 
-        # Sort by combined score in descending order
-        sorted_indices = sorted(relevance_scores, key=lambda x: x[1], reverse=True)
-        top_indices = [i for i, score in sorted_indices[:max_docs] if score >= similarity_threshold]
+        retrieved_docs = []
+        for result in results:
+            doc_id, about, text, similarity = result
+            if similarity >= similarity_threshold:
+                retrieved_docs.append(f'{about}. {text}')
 
-        # Retrieve the most relevant documents, including both 'about' and 'text' fields
-        retrieved_docs = [f'{self.knowledge_base[i]["about"]}. {self.knowledge_base[i]["text"]}' for i in top_indices]
-
-        if not retrieved_docs:
-            max_index = np.argmax(similarities)
-            retrieved_docs.append(f'{self.knowledge_base[max_index]["about"]}. {self.knowledge_base[max_index]["text"]}')
+        # If no documents meet the threshold, include the top result regardless
+        if not retrieved_docs and results:
+            best_match = results[0]
+            retrieved_docs.append(f'{best_match[1]}. {best_match[2]}')
 
         context = "\n\n".join(retrieved_docs)
         print("Retrieved Context:\n", context)
@@ -93,9 +169,9 @@ class RAGSystem:
                 "If the user's question involves comparisons with or references to other services, you may use external knowledge. "
                 "However, if the question is strictly about Defang, you must ignore all external knowledge and only utilize the given context. "
                 "When generating the answer, please put the answer first and the justification later. "
-                "Any mentions of BYOD means BRING YOUR OWN DOMAIN and NOT BRING YOUR OWN DEVICE."
+                "Any mentions of BYOD means BRING YOUR OWN DOMAIN and NOT BRING YOUR OWN DEVICE. "
                 "Your objective is to remain strictly within the confines of the given context unless comparisons to other services are explicitly mentioned. "
-                "Although this rarely happens, if the prompt is not related to defang reply with prompt out of scope. If the prompt contains the word `defang` proceed with answering"
+                "Although this rarely happens, if the prompt is not related to defang reply with prompt out of scope. If the prompt contains the word `defang` proceed with answering."
                 "\n\nContext:\n" + context + "\n\n"
                 "User Question: " + query + "\n\n"
                 "Answer:"
@@ -115,7 +191,7 @@ class RAGSystem:
                 presence_penalty=0
             )
 
-            # Print the response generated by the model
+            # Extract the response
             generated_response = response['choices'][0]['message']['content'].strip()
 
             print("Generated Response:\n", generated_response)
@@ -142,8 +218,8 @@ class RAGSystem:
         Rebuild the embeddings for the knowledge base. This should be called whenever the knowledge base is updated.
         """
         print("Rebuilding embeddings for the knowledge base...")
-        self.knowledge_base = self.load_knowledge_base()  # Reload the knowledge base
-        self.doc_embeddings = self.embed_knowledge_base()  # Rebuild the embeddings
+        self.load_knowledge_base()  # Reload the knowledge base
+        self.embed_knowledge_base()  # Rebuild the embeddings
         print("Embeddings have been rebuilt.")
 
 # Instantiate the RAGSystem

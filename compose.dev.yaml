@@ -11,8 +11,28 @@ services:
     environment:
       FLASK_APP: app.py
       OPENAI_API_KEY: ${OPENAI_API_KEY} # Set your OpenAI API key here or in the .env file
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: rag_system
+      DB_USER: user
+      DB_PASSWORD: password
     command: flask run --host=0.0.0.0
     deploy:
       resources:
         reservations:
           memory: 4G
+
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: rag_system
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: postgres -c 'shared_buffers=256MB' -c 'max_connections=200'
+
+volumes:
+  postgres_data:

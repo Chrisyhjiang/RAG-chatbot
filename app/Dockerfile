@@ -4,12 +4,13 @@ FROM python:3.9-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# Install system dependencies including Git, GCC, and build tools
-RUN apt-get update && apt-get install -y \
+# Update the package list and install system dependencies with --no-install-recommends to reduce the number of packages installed
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
     curl \
     git \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go for ARM architecture (latest supported version 1.21)
@@ -22,7 +23,8 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Install Node.js and npm
 RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && \
-    apt-get install -y nodejs
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install uWSGI and GitPython
 RUN pip install uwsgi gitpython
@@ -36,7 +38,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application source code into the container
 COPY . /app
 
-# Make the prebuild.sh script executable
+# Make the prebuild.sh script executable (if applicable)
 RUN chmod +x .tmp/prebuild.sh
 
 # Expose port 5000 for the Flask application
